@@ -1,0 +1,295 @@
+# =============================================================================
+# GitLab CI/CD Pipeline — Java Microservice
+# =============================================================================
+# Environments:  BUILD (digital-build) → ST (digital-st) → PT (digital-pt)
+#
+# Trigger matrix
+# ──────────────────────────────────────────────────────────────────────────────
+# Event                                   │ Stages that run
+# ────────────────────────────────────────┼────────────────────────────────────
+# MR  feature/* → release/*              │ install → dependency-check →
+#                                         │ code-quality → sast-scan →
+#                                         │ publish-war
+# ────────────────────────────────────────┼────────────────────────────────────
+# Push to release/*                       │ install → dependency-check →
+#                                         │ code-quality → sast-scan →
+#                                         │ publish-war → docker-build →
+#                                         │ deploy-build
+# ────────────────────────────────────────┼────────────────────────────────────
+# Tag  X.Y.Z-RCn-ST                      │ deploy-st
+# ────────────────────────────────────────┼────────────────────────────────────
+# Tag  X.Y.Z-RCn-PT                      │ docker-build-pt → deploy-pt
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Global defaults
+# ---------------------------------------------------------------------------
+default:
+  image: maven:3.9-eclipse-temurin-17   # single JDK image for all Maven jobs
+  retry:
+    max: 1
+    when: [runner_system_failure, stuck_or_timeout_failure]
+
+# ---------------------------------------------------------------------------
+# Variables
+# ---------------------------------------------------------------------------
+variables:
+  MAVEN_OPTS: >-
+    -Dmaven.repo.local=$CI_PROJECT_DIR/.m2/repository
+    -Dorg.slf4j.simpleLogger.showDateTime=true
+  IMAGE_TAG:     "SNAPSHOT-${CI_PROJECT_NAME}-${CI_COMMIT_SHA}"
+  IMAGE_REF:     "${CI_REGISTRY_IMAGE}:${IMAGE_TAG}"
+  PT_IMAGE_REF:  "${CI_PT_REGISTRY_IMAGE}:SNAPSHOT-${CI_PT_PROJECT_NAME}-${CI_COMMIT_SHA}"
+  KANIKO_IMAGE:  "xxxxxxxxxxxxx.dkr.ecr.eu-west-2.amazonaws.com/aws-np-digital-latest:kaniko-debug"
+
+# ---------------------------------------------------------------------------
+# Cache (shared across quality-gate stages)
+# ---------------------------------------------------------------------------
+cache:
+  key: "${CI_PROJECT_NAME}-maven"
+  paths:
+    - .m2/repository/
+  policy: pull-push
+
+# ---------------------------------------------------------------------------
+# Stage order
+# ---------------------------------------------------------------------------
+stages:
+  - install
+  - dependency-check
+  - code-quality
+  - sast-scan
+  - publish-war
+  - docker-build
+  - deploy-build
+  - deploy-st
+  - docker-build-pt
+  - deploy-pt
+
+# ========================  QUALITY GATE  ====================================
+
+# ---------------------------------------------------------------------------
+# 1. Install / compile
+# ---------------------------------------------------------------------------
+Install:
+  stage: install
+  script:
+    - mvn clean install -DskipTests -B
+  artifacts:
+    paths:
+      - target/*.war
+    expire_in: 1 hour
+  rules:
+    - if: >-
+        $CI_PIPELINE_SOURCE == "merge_request_event"
+        && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^release/
+    - if: >-
+        $CI_PIPELINE_SOURCE == "push"
+        && $CI_COMMIT_BRANCH =~ /^release/
+  tags: [Runner-tag-service]
+
+# ---------------------------------------------------------------------------
+# 2. OWASP Dependency-Check
+# ---------------------------------------------------------------------------
+Dependency_Check:
+  stage: dependency-check
+  needs: [Install]
+  script:
+    - mvn org.owasp:dependency-check-maven:check -B
+  allow_failure: true           # advisory — won't block pipeline
+  artifacts:
+    paths:
+      - target/dependency-check-report.html
+    expire_in: 7 days
+  rules:
+    - if: >-
+        $CI_PIPELINE_SOURCE == "merge_request_event"
+        && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^release/
+    - if: >-
+        $CI_PIPELINE_SOURCE == "push"
+        && $CI_COMMIT_BRANCH =~ /^release/
+  tags: [Runner-tag-service]
+
+# ---------------------------------------------------------------------------
+# 3. Code quality (SonarQube)
+# ---------------------------------------------------------------------------
+Code_Quality:
+  stage: code-quality
+  needs: [Install]
+  script:
+    - >-
+      mvn sonar:sonar
+      -Dsonar.host.url=${SONAR_HOST_URL}
+      -Dsonar.login=${SONAR_TOKEN}
+      -Dsonar.projectKey=${CI_PROJECT_NAME}
+      -B
+  allow_failure: true
+  rules:
+    - if: >-
+        $CI_PIPELINE_SOURCE == "merge_request_event"
+        && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^release/
+    - if: >-
+        $CI_PIPELINE_SOURCE == "push"
+        && $CI_COMMIT_BRANCH =~ /^release/
+  tags: [Runner-tag-service]
+
+# ---------------------------------------------------------------------------
+# 4. SAST scan
+# ---------------------------------------------------------------------------
+SAST_Scan:
+  stage: sast-scan
+  needs: [Install]
+  script:
+    - mvn spotbugs:spotbugs -B
+  artifacts:
+    paths:
+      - target/spotbugsXml.xml
+    expire_in: 7 days
+  allow_failure: true
+  rules:
+    - if: >-
+        $CI_PIPELINE_SOURCE == "merge_request_event"
+        && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^release/
+    - if: >-
+        $CI_PIPELINE_SOURCE == "push"
+        && $CI_COMMIT_BRANCH =~ /^release/
+  tags: [Runner-tag-service]
+
+# ---------------------------------------------------------------------------
+# 5. Publish WAR to Nexus
+# ---------------------------------------------------------------------------
+Publish_WAR:
+  stage: publish-war
+  needs: [Install]
+  script:
+    - >-
+      mvn deploy
+      -DskipTests
+      -DaltDeploymentRepository=nexus::default::${NEXUS_REPO_URL}
+      -B
+  rules:
+    - if: >-
+        $CI_PIPELINE_SOURCE == "merge_request_event"
+        && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^release/
+    - if: >-
+        $CI_PIPELINE_SOURCE == "push"
+        && $CI_COMMIT_BRANCH =~ /^release/
+  tags: [Runner-tag-service]
+
+# ========================  BUILD ENV DEPLOY  ================================
+
+# ---------------------------------------------------------------------------
+# 6. Docker image — BUILD environment
+# ---------------------------------------------------------------------------
+.kaniko_base: &kaniko_base
+  image:
+    name: ${KANIKO_IMAGE}
+    entrypoint: [""]
+  before_script:
+    - mkdir -p /kaniko/.docker
+    - echo '{"credsStore":"ecr-login"}' > /kaniko/.docker/config.json
+  tags: [Runner-tag-tools]
+
+Docker_Build:
+  <<: *kaniko_base
+  stage: docker-build
+  needs: [Install, Publish_WAR]
+  script:
+    - >-
+      /kaniko/executor
+      --context      "${CI_PROJECT_DIR}"
+      --dockerfile   "${CI_PROJECT_DIR}/Dockerfile"
+      --build-arg    BASE_IMAGE=${baseImage}
+      --build-arg    JBOSS_PART_PATH=/opt/jboss/wildfly/standalone/deployments
+      --cache=true
+      --destination  "${IMAGE_REF}"
+      --destination  "${CI_REGISTRY_IMAGE_LATEST}:${CI_PROJECT_NAME}-ST"
+      --destination  "${CI_REGISTRY_IMAGE_LATEST}:${CI_PROJECT_NAME}-BE"
+    - echo "Pushed → ${IMAGE_REF}"
+  rules:
+    - if: >-
+        $CI_PIPELINE_SOURCE == "push"
+        && $CI_COMMIT_BRANCH =~ /^release/
+  tags: [Runner-tag-tools]
+
+# ---------------------------------------------------------------------------
+# 7. K8s deploy — BUILD namespace
+# ---------------------------------------------------------------------------
+.k8s_deploy_base: &k8s_deploy_base
+  before_script:
+    - sudo su - gitlab-runner
+    - export KUBECONFIG=/home/gitlab-runner/.kube/config
+    - export AWS_PROFILE=aws-eks-gitlab-user
+  tags: [Runner-tag-service]
+
+Deploy_Build:
+  <<: *k8s_deploy_base
+  stage: deploy-build
+  needs: [Docker_Build]
+  script:
+    - kubectl config use-context aws-np-cluster
+    - kubectl -n digital-build set image deployment/${CI_PROJECT_NAME}
+        ${CI_PROJECT_NAME}="${IMAGE_REF}"
+    - kubectl rollout restart deployment/${CI_PROJECT_NAME} -n digital-build
+    - kubectl rollout status  deployment/${CI_PROJECT_NAME} -n digital-build --timeout=300s
+    - echo "Deployed → digital-build  image=${IMAGE_REF}"
+  rules:
+    - if: >-
+        $CI_PIPELINE_SOURCE == "push"
+        && $CI_COMMIT_BRANCH =~ /^release/
+
+# ========================  ST ENV DEPLOY (tag)  =============================
+
+# ---------------------------------------------------------------------------
+# 8. K8s deploy — ST namespace
+# ---------------------------------------------------------------------------
+Deploy_ST:
+  <<: *k8s_deploy_base
+  stage: deploy-st
+  script:
+    - kubectl config use-context aws-np-cluster
+    - kubectl -n digital-st set image deployment/${CI_PROJECT_NAME}
+        ${CI_PROJECT_NAME}="${IMAGE_REF}"
+    - kubectl rollout restart deployment/${CI_PROJECT_NAME} -n digital-st
+    - kubectl rollout status  deployment/${CI_PROJECT_NAME} -n digital-st --timeout=300s
+    - echo "Deployed → digital-st  image=${IMAGE_REF}"
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^\d+\.\d+\.\d+-RC\d+-ST$/'
+
+# ========================  PT ENV DEPLOY (tag)  =============================
+
+# ---------------------------------------------------------------------------
+# 9. Docker image — PT environment
+# ---------------------------------------------------------------------------
+Docker_Build_PT:
+  <<: *kaniko_base
+  stage: docker-build-pt
+  script:
+    - >-
+      /kaniko/executor
+      --context      "${CI_PROJECT_DIR}"
+      --dockerfile   "${CI_PROJECT_DIR}/Dockerfile"
+      --build-arg    BASE_IMAGE=${BasePTImage}
+      --build-arg    JBOSS_PART_PATH=/opt/jboss/wildfly/standalone/deployments
+      --cache=true
+      --destination  "${PT_IMAGE_REF}"
+    - echo "Pushed → ${PT_IMAGE_REF}"
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^\d+\.\d+\.\d+-RC\d+-PT$/'
+
+# ---------------------------------------------------------------------------
+# 10. K8s deploy — PT namespace
+# ---------------------------------------------------------------------------
+Deploy_PT:
+  <<: *k8s_deploy_base
+  stage: deploy-pt
+  needs: [Docker_Build_PT]
+  script:
+    - kubectl config use-context aws-np-pt-cluster
+    - kubectl -n digital-pt set image deployment/${CI_PROJECT_NAME}
+        ${CI_PROJECT_NAME}="${PT_IMAGE_REF}"
+    - kubectl rollout restart deployment/${CI_PROJECT_NAME} -n digital-pt
+    - kubectl rollout status  deployment/${CI_PROJECT_NAME} -n digital-pt --timeout=300s
+    - echo "Deployed → digital-pt  image=${PT_IMAGE_REF}"
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^\d+\.\d+\.\d+-RC\d+-PT$/'

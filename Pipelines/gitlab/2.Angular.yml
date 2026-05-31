@@ -1,0 +1,342 @@
+# =============================================================================
+# GitLab CI/CD Pipeline — Node.js UI Microservice
+# =============================================================================
+# Environments:  BUILD (digital-build) → ST (digital-st) → PT (digital-pt)
+#
+# Trigger matrix
+# ──────────────────────────────────────────────────────────────────────────────
+# Event                                   │ Stages that run
+# ────────────────────────────────────────┼────────────────────────────────────
+# MR  feature/* → release/*              │ install → lint → build →
+#                                         │ code-quality → fortify-scan
+# ────────────────────────────────────────┼────────────────────────────────────
+# Push to release/*                       │ install → lint → build →
+#                                         │ code-quality → fortify-scan →
+#                                         │ docker-build → deploy-build
+# ────────────────────────────────────────┼────────────────────────────────────
+# Tag  X.Y.Z-RCn-ST                      │ deploy-st
+# ────────────────────────────────────────┼────────────────────────────────────
+# Tag  X.Y.Z-RCn-PT                      │ install → lint → build →
+#                                         │ docker-build-pt → deploy-pt
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Global defaults
+# ---------------------------------------------------------------------------
+default:
+  image:
+    name: "xxxxxxxxxxxx7.dkr.ecr.eu-west-2.amazonaws.com/aws-np-application:node-20.19.0"
+    entrypoint: [""]
+  retry:
+    max: 1
+    when: [runner_system_failure, stuck_or_timeout_failure]
+
+# ---------------------------------------------------------------------------
+# Variables
+# ---------------------------------------------------------------------------
+variables:
+  GIT_DEPTH: 1
+  NODE_OPTIONS: "--max_old_space_size=4096"
+  NPM_REGISTRY: "htRunner-tag://repo.dso.np.teacherscorp.co.uk/repository/dso-npm-group-01/"
+  # Image coordinates
+  CI_REGISTRY_IMAGE: "xxxxxxxxxxxx7.dkr.ecr.eu-west-2.amazonaws.com/aws-np-application"
+  IMAGE_TAG:         "SNAPSHOT-${CI_PROJECT_NAME}-${CI_COMMIT_SHA}"
+  IMAGE_REF:         "${CI_REGISTRY_IMAGE}:${IMAGE_TAG}"
+  KANIKO_IMAGE:      "xxxxxxxxxxxx7.dkr.ecr.eu-west-2.amazonaws.com/aws-np-digital-latest:kaniko-debug"
+  baseImage:         "214833366399.dkr.ecr.eu-west-2.amazonaws.com/aws-dso-base_images:httpd-patched-2.4.66"
+  # SonarQube
+  SONAR_CLI_OPTS:    "-Dsonar.projectKey=${CI_PROJECT_ID} -Dsonar.projectName=${CI_PROJECT_NAME}"
+  SONAR_LOGIN_OPTS:  "-Dsonar.login=$SONAR_LOGIN"
+  # Notifications
+  SENDER:   "pipeline.notification@teacherscorp.com"
+  RECEIVER: "Runner-tag.DigitalPipeline@tcs.com"
+
+# ---------------------------------------------------------------------------
+# Cache — node_modules + build output
+# ---------------------------------------------------------------------------
+cache:
+  key: "${CI_PROJECT_NAME}-node"
+  paths:
+    - node_modules/
+    - .npm/
+    - coverage/
+    - dist/
+  policy: pull-push
+
+# ---------------------------------------------------------------------------
+# Workflow rules
+# ---------------------------------------------------------------------------
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^release/'
+      when: always
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH =~ /^release/ && $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME != "release"'
+      when: always
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG =~ /^\d+\.\d+\.\d+-RC\d+-ST$/'
+      when: always
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG =~ /^\d+\.\d+\.\d+-RC\d+-PT$/'
+      when: always
+    - when: never
+
+# ---------------------------------------------------------------------------
+# Stage order
+# ---------------------------------------------------------------------------
+stages:
+  - install
+  - lint
+  - build
+  - code-quality
+  - fortify-scan
+  - docker-build
+  - deploy-build
+  - deploy-st
+  - docker-build-pt
+  - deploy-pt
+
+# ---------------------------------------------------------------------------
+# Reusable rule sets (YAML anchors)
+# ---------------------------------------------------------------------------
+.rules_mr_and_release: &rules_mr_and_release
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^release/'
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH =~ /^release/'
+    - if: '$CI_COMMIT_TAG =~ /^\d+\.\d+\.\d+-RC\d+-PT$/'
+
+.rules_release_push: &rules_release_push
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH =~ /^release/'
+
+.rules_tag_st: &rules_tag_st
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^\d+\.\d+\.\d+-RC\d+-ST$/'
+
+.rules_tag_pt: &rules_tag_pt
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^\d+\.\d+\.\d+-RC\d+-PT$/'
+
+# ========================  QUALITY GATE  ====================================
+
+# ---------------------------------------------------------------------------
+# 1. Install dependencies
+# ---------------------------------------------------------------------------
+Install:
+  stage: install
+  script:
+    - echo "Node $(node --version)  npm $(npm --version)"
+    - npm -g config set registry ${NPM_REGISTRY}
+    - npm config set fetch-timeout 600000
+    - npm config set fetch-retries 5
+    - npm cache clean --force
+    - npm install --force
+  <<: *rules_mr_and_release
+  tags: [Runner-tag-ui]
+
+# ---------------------------------------------------------------------------
+# 2. Lint
+# ---------------------------------------------------------------------------
+Lint:
+  stage: lint
+  needs: [Install]
+  script:
+    - npm run lint
+  <<: *rules_mr_and_release
+  tags: [Runner-tag-ui]
+
+# ---------------------------------------------------------------------------
+# 3. Build (production bundle)
+# ---------------------------------------------------------------------------
+Build:
+  stage: build
+  needs: [Lint]
+  script:
+    - npm run build
+  artifacts:
+    paths:
+      - dist/
+    expire_in: 1 hour
+  <<: *rules_mr_and_release
+  tags: [Runner-tag-ui]
+
+# ---------------------------------------------------------------------------
+# 4. Code quality — SonarQube
+# ---------------------------------------------------------------------------
+Code_Quality:
+  stage: code-quality
+  needs: [Install]
+  allow_failure: true
+  script:
+    - >-
+      npx @sonar/scan
+      -Dsonar.typescript.tslint.reportPaths=coverage/lint_report.json
+      -Dsonar.projectKey="${CI_PROJECT_NAME}"
+      -Dsonar.projectName="${CI_PROJECT_NAME}"
+      ${SONAR_LOGIN_OPTS}
+      -Dsonar.dependencyCheck.severity.major=4.0
+      -Dsonar.sources=src
+      -Dsonar.qualitygate.wait=true
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^\d+\.\d+\.\d+-RC\d+-ST$/'
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^release/'
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH =~ /^release/'
+  tags: [Runner-tag-ui]
+
+# ---------------------------------------------------------------------------
+# 5. Fortify SAST (manual trigger)
+# ---------------------------------------------------------------------------
+Fortify_Scan:
+  stage: fortify-scan
+  needs: [Install]
+  allow_failure: true
+  script:
+    - sudo /opt/Fortify/Fortify_SCA_24.2.0/bin/sourceanalyzer -b ${CI_PROJECT_NAME} -clean
+    - >-
+      sudo /opt/Fortify/Fortify_SCA_24.2.0/bin/sourceanalyzer
+      -Xms2048m -Xmx8192m
+      -b ${CI_PROJECT_NAME}
+      -jdk 1.8 ${CI_PROJECT_DIR}
+      -verbose
+      -Dtimeout.overall=14400
+      -Dtimeout.scan=14400
+    - >-
+      sudo /opt/Fortify/Fortify_SCA_24.2.0/bin/sourceanalyzer
+      -Xms2048m -Xmx8192m
+      -b ${CI_PROJECT_NAME}
+      -scan -f results.fpr
+      -Dtimeout.overall=14400
+      -Dtimeout.scan=14400
+      -verbose
+    - >-
+      sudo /opt/Fortify/Fortify_SCA_24.2.0/bin/fortifyclient
+      -url ${SSC_URL}
+      -authtoken ${CI_TOKEN_SC}
+      uploadFPR -file results.fpr
+      -project ${CI_PROJECT_NAME}
+      -version v1
+  artifacts:
+    paths:
+      - results.fpr
+    expire_in: 7 days
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^\d+\.\d+\.\d+-RC\d+-ST$/'
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^release/'
+      when: manual
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH =~ /^release/'
+      when: manual
+  tags: [Runner-tag-sast]
+
+# ========================  BUILD ENV DEPLOY  ================================
+
+# ---------------------------------------------------------------------------
+# Kaniko base (YAML anchor)
+# ---------------------------------------------------------------------------
+.kaniko_base: &kaniko_base
+  image:
+    name: ${KANIKO_IMAGE}
+    entrypoint: [""]
+  before_script:
+    - mkdir -p /kaniko/.docker
+    - echo '{"credsStore":"ecr-login"}' > /kaniko/.docker/config.json
+
+# ---------------------------------------------------------------------------
+# 6. Docker build — BUILD environment
+# ---------------------------------------------------------------------------
+Docker_Build:
+  <<: *kaniko_base
+  stage: docker-build
+  needs: [Build]
+  script:
+    - >-
+      /kaniko/executor
+      --context      "${CI_PROJECT_DIR}"
+      --dockerfile   "${CI_PROJECT_DIR}/Dockerfile"
+      --build-arg    BASE_IMAGE=${baseImage}
+      --cache=true
+      --destination  "${IMAGE_REF}"
+      --destination  "${CI_REGISTRY_IMAGE_LATEST}:${CI_PROJECT_NAME}-latest"
+    - echo "Pushed → ${IMAGE_REF}"
+  <<: *rules_release_push
+  tags: [Runner-tag-ui]
+
+# ---------------------------------------------------------------------------
+# K8s deploy base (YAML anchor)
+# ---------------------------------------------------------------------------
+.k8s_deploy_base: &k8s_deploy_base
+  before_script:
+    - sudo su - gitlab-runner
+    - export KUBECONFIG=/home/gitlab-runner/.kube/config
+    - export AWS_PROFILE=aws-eks-gitlab-user
+
+# ---------------------------------------------------------------------------
+# 7. K8s deploy — BUILD namespace
+# ---------------------------------------------------------------------------
+Deploy_Build:
+  <<: *k8s_deploy_base
+  stage: deploy-build
+  needs: [Docker_Build]
+  script:
+    - kubectl config use-context aws-np-cluster
+    - kubectl -n digital-build set image deployment/${CI_PROJECT_NAME}
+        ${CI_PROJECT_NAME}="${IMAGE_REF}"
+    - kubectl rollout restart deployment/${CI_PROJECT_NAME} -n digital-build
+    - kubectl rollout status  deployment/${CI_PROJECT_NAME} -n digital-build --timeout=300s
+    - echo "Deployed → digital-build  image=${IMAGE_REF}"
+  <<: *rules_release_push
+  tags: [Runner-tag-uishell]
+
+# ========================  ST ENV DEPLOY (tag)  =============================
+
+# ---------------------------------------------------------------------------
+# 8. K8s deploy — ST namespace
+# ---------------------------------------------------------------------------
+Deploy_ST:
+  <<: *k8s_deploy_base
+  stage: deploy-st
+  script:
+    - kubectl config use-context aws-np-cluster
+    - kubectl -n digital-st set image deployment/${CI_PROJECT_NAME}
+        ${CI_PROJECT_NAME}="${IMAGE_REF}"
+    - kubectl rollout restart deployment/${CI_PROJECT_NAME} -n digital-st
+    - kubectl rollout status  deployment/${CI_PROJECT_NAME} -n digital-st --timeout=300s
+    - echo "Deployed → digital-st  image=${IMAGE_REF}"
+  <<: *rules_tag_st
+  tags: [Runner-tag-uishell]
+
+# ========================  PT ENV DEPLOY (tag)  =============================
+
+# ---------------------------------------------------------------------------
+# 9. Docker build — PT environment
+# ---------------------------------------------------------------------------
+Docker_Build_PT:
+  <<: *kaniko_base
+  stage: docker-build-pt
+  needs: [Build]
+  script:
+    - >-
+      /kaniko/executor
+      --context      "${CI_PROJECT_DIR}"
+      --dockerfile   "${CI_PROJECT_DIR}/Dockerfile"
+      --build-arg    BASE_IMAGE=${baseImage}
+      --cache=true
+      --destination  "${IMAGE_REF}"
+    - echo "Pushed → ${IMAGE_REF}"
+  <<: *rules_tag_pt
+  tags: [Runner-tag-ui]
+
+# ---------------------------------------------------------------------------
+# 10. K8s deploy — PT namespace
+# ---------------------------------------------------------------------------
+Deploy_PT:
+  <<: *k8s_deploy_base
+  stage: deploy-pt
+  needs: [Docker_Build_PT]
+  script:
+    - kubectl config use-context aws-np-pt-cluster
+    - kubectl -n digital-pt set image deployment/${CI_PROJECT_NAME}
+        ${CI_PROJECT_NAME}="${IMAGE_REF}"
+    - kubectl rollout restart deployment/${CI_PROJECT_NAME} -n digital-pt
+    - kubectl rollout status  deployment/${CI_PROJECT_NAME} -n digital-pt --timeout=300s
+    - echo "Deployed → digital-pt  image=${IMAGE_REF}"
+  <<: *rules_tag_pt
+  tags: [Runner-tag-uishell]
