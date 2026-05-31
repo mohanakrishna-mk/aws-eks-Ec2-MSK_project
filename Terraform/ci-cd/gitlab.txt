@@ -1,0 +1,48 @@
+resource "aws_instance" "ci_cd_gitlab_server" {
+  ami                         = "ami-03f4878755434977f"
+  instance_type               = "t3.large"
+  subnet_id                   = aws_subnet.ci_cd_public_subnet.id
+  vpc_security_group_ids      = [aws_security_group.ci_cd_sg.id]
+  associate_public_ip_address = true
+  key_name                    = "ec2-key"
+
+  root_block_device {
+    volume_size = 50
+    volume_type = "gp3"
+  }
+
+  user_data = <<-EOF
+#!/bin/bash
+
+set -e
+
+apt-get update -y
+apt-get install -y ca-certificates curl openssh-server tzdata perl
+
+curl -s https://packages.gitlab.com/install/repositories/gitlab/gitlab-ce/script.deb.sh | bash
+
+EXTERNAL_URL="https://gitlab.99cloudtest.com" apt-get install -y gitlab-ce
+
+EOF
+
+  tags = {
+    Name = "ci-cd-gitlab-server"
+  }
+}
+
+data "aws_route53_zone" "main" {
+  name         = "99cloudtest.com"
+  private_zone = false
+}
+
+resource "aws_route53_record" "gitlab" {
+  zone_id = data.aws_route53_zone.main.zone_id
+
+  name = "gitlab.99cloudtest.com"
+  type = "A"
+  ttl  = 300
+
+  records = [
+    aws_instance.ci_cd_gitlab_server.public_ip
+  ]
+}

@@ -1,0 +1,37 @@
+image: alpine:latest
+
+stages:
+  - build
+  - test
+  - deploy
+
+build_job:
+  stage: build
+  tags:
+    - test
+  script:
+    - echo "Building the application files..."
+    - mkdir build
+    - echo "Compiled assets" > build/index.html
+  artifacts:
+    paths:
+      - build/
+
+test_job:
+  stage: test
+  tags:
+    - test
+  script:
+    - echo "Running unit tests..."
+    - test -f build/index.html
+
+deploy_job:
+  stage: deploy
+  tags:
+    - test
+  script:
+    - echo "Deploying code to the production environment..."
+  environment:
+    name: production
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
